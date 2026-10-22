@@ -1,0 +1,9 @@
+dist/
+.clx-dev/
+*.clx.rom
+.DS_Store
+walkie_talkie.rec
+tools/out.wav
+
+.agents/
+.claude/

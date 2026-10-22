@@ -1,0 +1,9 @@
+.DS_Store
+.agents/
+.claude/
+
+**/dist/
+**/.clx-dev/
+**/*.clx.rom
+**/*.rec
+**/tools/out.wav

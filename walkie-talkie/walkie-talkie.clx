@@ -1,0 +1,22 @@
+coloX-16
+version 1
+style:game
+name:walkie-talkie
+author:nan
+desc:LAN walkie-talkie with PTT, auto discovery and Opus/PCM audio
+
+__lua__
+#include src/util.lua
+#include src/net.lua
+#include src/audio.lua
+#include src/main.lua
+
+__gfx__
+
+__gff__
+
+__map__
+
+__sfx__
+
+__music__

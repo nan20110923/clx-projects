@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "clx-dev": {
+      "source": "nan20110923/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/clx-dev/SKILL.md",
+      "computedHash": "2b9a17dbcd90d95b08bdb365290eaebc8a3e9b4125bc66eb4f310936df5df158"
+    }
+  }
+}
