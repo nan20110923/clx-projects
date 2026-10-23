@@ -1,5 +1,49 @@
 -- Microphone capture, Opus/PCM playback, jitter buffer and local tones.
 
+-- Rx-side jitter diagnostics, readable over the debug channel with "p DBG"
+-- and exercised by .clx-dev/jitter-loop.sh. Counters only; no behavior change.
+DBG = {
+  q_starve = 0,    -- ticks with playback queue empty while receiving
+  underruns = 0,   -- starve-then-more-audio events (audible gap candidates)
+  wave_empty = 0,  -- ticks with wave buffer empty while receiving
+  wave_l_min = 1e9, -- wave('L') low water in bytes while receiving
+  rx_q_max = 0,    -- queue high water (frames)
+  resets = 0,      -- push_rx hard resets (large seq gap)
+  drops = 0,       -- frames dropped from queue head (overflow)
+  gap_ms_max = 0,  -- max inter-batch gap within a talk burst (ms)
+  batch_max = 0,   -- max packets arriving in the same tick
+  batch_hist = { b1 = 0, b2 = 0, b4 = 0, b8 = 0, b16 = 0, b17p = 0 },
+  _arr_t = 0,
+  _batch_n = 0,
+  _starving = false,
+}
+
+-- Zero all counters (called over the debug channel).
+function DBG_reset()
+  DBG.q_starve, DBG.underruns, DBG.wave_empty = 0, 0, 0
+  DBG.wave_l_min, DBG.rx_q_max = 1e9, 0
+  DBG.resets, DBG.drops, DBG.gap_ms_max, DBG.batch_max = 0, 0, 0, 0
+  DBG.batch_hist = { b1 = 0, b2 = 0, b4 = 0, b8 = 0, b16 = 0, b17p = 0 }
+  DBG._arr_t, DBG._batch_n, DBG._starving = 0, 0, false
+end
+
+-- One accepted audio packet arrived; same-tick packets form a batch.
+-- Gap tracking lives in push_rx (production); this only batches.
+function DBG_arrival(now)
+  if now ~= DBG._arr_t then
+    local n = DBG._batch_n
+    if n > 0 then
+      if n > DBG.batch_max then DBG.batch_max = n end
+      local k = n <= 1 and "b1" or n <= 2 and "b2" or n <= 4 and "b4"
+        or n <= 8 and "b8" or n <= 16 and "b16" or "b17p"
+      DBG.batch_hist[k] = DBG.batch_hist[k] + 1
+    end
+    DBG._arr_t = now
+    DBG._batch_n = 0
+  end
+  DBG._batch_n = DBG._batch_n + 1
+end
+
 AUDIO = {
   mic_ok = false,
   wave_ok = false,
@@ -19,8 +63,15 @@ AUDIO = {
   rx_last_seq = nil,
   last_rx_time = 0,
   prebuffered = false,
-  prebuffer = 3,
-  max_q = 8,
+  prebuffer = JBUF_MIN,
+  max_q = JBUF_MIN + 16,
+  -- Adaptive jitter buffer state. prebuffer/max_q derive from jbuf, which
+  -- sizes itself from the worst inter-arrival gap observed in each talk burst.
+  jbuf = JBUF_MIN,
+  _starved = false,
+  _last_arr = 0,
+  _gap_ms = 0,
+  last_decay = 0,
   fps = 60,
   last_fps = 0,
   mic_level = 0,
@@ -73,8 +124,38 @@ function AUDIO.update_fps(now)
   AUDIO.last_fps = now
   local f = stat(7)
   if f and f > 1 then AUDIO.fps = f end
-  AUDIO.prebuffer = clamp(math.ceil(1.5 / AUDIO.fps / 0.02), 3, 8)
-  AUDIO.max_q = AUDIO.prebuffer + 5
+  AUDIO.jbuf_apply()
+end
+
+-- Recompute the playout runway from the adaptive target and the local frame
+-- rate (the frame loop itself adds up to 1.5 frames of scheduling jitter).
+function AUDIO.jbuf_apply()
+  local fps_pre = clamp(math.ceil(1.5 / AUDIO.fps / 0.02), 3, 8)
+  AUDIO.prebuffer = math.max(fps_pre, AUDIO.jbuf)
+  AUDIO.max_q = AUDIO.prebuffer + 16
+end
+
+-- Resize the jitter buffer to cover an observed inter-arrival gap and pause
+-- feeding until the new runway has been rebuilt.
+function AUDIO.jbuf_grow(now)
+  local want = math.ceil(AUDIO._gap_ms / FRAME_MS) + JBUF_MARGIN
+  if want < AUDIO.jbuf + 1 then want = AUDIO.jbuf + 1 end
+  if want > JBUF_MAX then want = JBUF_MAX end
+  AUDIO.jbuf = want
+  AUDIO.jbuf_apply()
+  AUDIO.prebuffered = false
+  AUDIO.last_decay = now
+end
+
+-- Slowly give latency back when the buffer is comfortably larger than the
+-- jitter actually seen in the current burst.
+function AUDIO.jbuf_decay(now)
+  if AUDIO.jbuf <= JBUF_MIN then return end
+  if now - AUDIO.last_decay < 8 then return end
+  if AUDIO._gap_ms >= (AUDIO.prebuffer - 2) * FRAME_MS then return end
+  AUDIO.jbuf = AUDIO.jbuf - 1
+  AUDIO.jbuf_apply()
+  AUDIO.last_decay = now
 end
 
 function AUDIO.play(name)
@@ -100,6 +181,9 @@ function AUDIO.reset_rx()
   AUDIO.rx_last_seq = nil
   AUDIO.rx_level = 0
   AUDIO.prebuffered = false
+  AUDIO._starved = false
+  AUDIO._gap_ms = 0
+  AUDIO._last_arr = 0
 end
 
 function AUDIO.start_tx(now)
@@ -135,9 +219,11 @@ function AUDIO.push_frame(data, codec)
     return
   end
   AUDIO.rx_q[#AUDIO.rx_q + 1] = { codec = codec, data = data }
+  if #AUDIO.rx_q > DBG.rx_q_max then DBG.rx_q_max = #AUDIO.rx_q end  -- diagnostics
   while #AUDIO.rx_q > AUDIO.max_q do
     table.remove(AUDIO.rx_q, 1)
     AUDIO.prebuffered = false
+    DBG.drops = DBG.drops + 1  -- diagnostics
   end
 end
 
@@ -273,21 +359,46 @@ function AUDIO.push_rx(peer, seq, data, codec, now)
     return
   end
   if AUDIO.rx_peer and AUDIO.rx_peer.id ~= peer.id then return end
+  DBG_arrival(now)  -- diagnostics
   if not AUDIO.rx_peer then
     AUDIO.rx_q = {}
     AUDIO.rx_last_seq = nil
     AUDIO.prebuffered = false
+    AUDIO._gap_ms = 0       -- new talk burst: jitter evidence restarts
+    AUDIO._last_arr = 0
     AUDIO.rx_peer = peer
+  end
+  -- Track the worst inter-arrival gap within this talk burst; the adaptive
+  -- jitter buffer sizes itself from it.
+  if AUDIO._last_arr > 0 then
+    local gap = (now - AUDIO._last_arr) * 1000
+    if gap < 3000 and gap > AUDIO._gap_ms then
+      AUDIO._gap_ms = gap
+      if gap > DBG.gap_ms_max then DBG.gap_ms_max = gap end  -- diagnostics
+    end
+  end
+  AUDIO._last_arr = now
+  if AUDIO._starved then
+    -- Starved mid-stream and more audio arrived: audible gap. Grow now so
+    -- the next batch does not repeat it.
+    DBG.underruns = DBG.underruns + 1  -- diagnostics
+    AUDIO._starved = false
+    AUDIO.jbuf_grow(now)
+  elseif AUDIO._gap_ms + 1000 / AUDIO.fps > AUDIO.prebuffer * FRAME_MS then
+    -- Preventive: observed jitter plus one frame-tick of scheduling delay
+    -- already exceeds our runway; grow before the buffer starves.
+    AUDIO.jbuf_grow(now)
   end
   if AUDIO.rx_last_seq then
     local d = (seq - AUDIO.rx_last_seq) % 65536
     if d == 0 or d > 32768 then return end
     if d > 1 then
-      if d <= 11 then
+      if d <= 20 then
         for _ = 2, d do AUDIO.push_frame(silence(FRAME_BYTES), CODEC_PCM) end
       else
         AUDIO.rx_q = {}
         AUDIO.prebuffered = false
+        DBG.resets = DBG.resets + 1  -- diagnostics
       end
     end
   end
@@ -340,6 +451,14 @@ function AUDIO.feed_rx(now)
       AUDIO.rx_active = false
       AUDIO.rx_peer = nil
       AUDIO.prebuffered = false
+      AUDIO._starved = false  -- natural talk end, not an underrun
+      AUDIO._gap_ms = 0       -- burst over; jitter evidence expires
+      AUDIO._last_arr = 0
+    elseif AUDIO.rx_active and AUDIO.prebuffered then
+      DBG.q_starve = DBG.q_starve + 1  -- diagnostics queue empty (diagnostic)
+      -- The queue drains into wave every tick, so an empty queue alone is not
+      -- a gap. Only an empty wave buffer means audible starvation.
+      if AUDIO.buffered() == 0 then AUDIO._starved = true end
     end
     return
   end
@@ -365,8 +484,14 @@ function AUDIO.update(now)
     AUDIO.capture(now)
   else
     AUDIO.feed_rx(now)
+    AUDIO.jbuf_decay(now)
     AUDIO.rx_level = AUDIO.rx_level * 0.86
     if AUDIO.rx_level < 0.005 then AUDIO.rx_level = 0 end
+    if AUDIO.rx_active then  -- diagnostics wave output buffer sampling
+      local bl = AUDIO.buffered()
+      if bl < DBG.wave_l_min then DBG.wave_l_min = bl end
+      if bl == 0 and AUDIO.prebuffered then DBG.wave_empty = DBG.wave_empty + 1 end
+    end
   end
 
   local target = 0

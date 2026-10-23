@@ -596,6 +596,7 @@ function APP.draw_net()
     "PEER " .. NET.peer_count(CFG.channel) .. "/4",
     "FIX  " .. (CFG.fixed_ip == "" and "AUTO" or CFG.fixed_ip),
     "CODEC " .. (AUDIO.opus_ok and "OPUS" or "PCM"),
+    "JBUF " .. AUDIO.jbuf .. "F/" .. AUDIO.prebuffer * FRAME_MS .. "MS",
     "TX " .. NET.tx_packets .. "  RX " .. NET.rx_packets,
     "BUF " .. AUDIO.buffered() .. "B",
     "ERR " .. NET.tx_errors,

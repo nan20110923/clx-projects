@@ -42,8 +42,13 @@ PORT_TRIES = 10
 
 PEER_TIMEOUT = 8.0
 TALK_TIMEOUT = 0.8
-RX_TAIL = 0.35
+RX_TAIL = 0.6                 -- end-of-rx grace; real WiFi can batch packets ~300ms apart
 RX_HOLD = 0.5
+
+FRAME_MS = 20                 -- one playback frame in ms
+JBUF_MIN = 3                  -- adaptive jitter buffer floor (frames = 60 ms)
+JBUF_MAX = 20                 -- adaptive jitter buffer ceiling (frames = 400 ms)
+JBUF_MARGIN = 2               -- frames kept on top of observed jitter
 
 HEADER_FMT = "<c2 B B B I2 I2"
 

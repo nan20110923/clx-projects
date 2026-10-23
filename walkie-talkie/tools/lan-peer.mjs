@@ -34,6 +34,9 @@ const record = flag('record')
 const tone = flag('tone')
 const wavIn = arg('wav-in', '')
 const outFile = arg('out', 'tools/out.wav')
+// batch N frames every burstMs instead of one frame per 20ms,
+// emulating DTIM/power-save batched delivery on real WiFi. 0 = native pacing.
+const burstMs = Number(arg('burst', 0))
 
 const TYPE = { announce: 1, audio: 2, voice: 3, call: 4, bye: 5 }
 
@@ -105,24 +108,40 @@ function sineFrame(freq, phase) {
   return { frame: b, phase: (phase + 320) % 16000 }
 }
 
+// [DEBUG-jit] burstMs > 0 batches round(burstMs/20) frames every burstMs,
+// reproducing the batched arrival pattern seen on power-saving WiFi.
+
 function sendTone(ms = 1500, freq = 440) {
   if (toneTimer) return
-  log(`sending ${ms}ms ${freq}Hz tone`)
+  log(`sending ${ms}ms ${freq}Hz tone${burstMs > 0 ? ` burst=${burstMs}ms` : ''}`)
   sendVoice(true)
   let phase = 0
   const frames = Math.round(ms / 20)
   let n = 0
-  toneTimer = setInterval(() => {
-    const r = sineFrame(freq, phase)
-    phase = r.phase
-    send(Buffer.concat([header(TYPE.audio, audioSeq++), Buffer.from([0]), r.frame]))
-    if (++n >= frames) {
-      clearInterval(toneTimer)
-      toneTimer = null
-      sendVoice(false)
-      log('tone done')
-    }
-  }, 20)
+  const stop = () => {
+    clearInterval(toneTimer)
+    toneTimer = null
+    sendVoice(false)
+    log('tone done')
+  }
+  if (burstMs > 0) {
+    const per = Math.max(1, Math.round(burstMs / 20))
+    toneTimer = setInterval(() => {
+      for (let i = 0; i < per && n < frames; i++, n++) {
+        const r = sineFrame(freq, phase)
+        phase = r.phase
+        send(Buffer.concat([header(TYPE.audio, audioSeq++), Buffer.from([0]), r.frame]))
+      }
+      if (n >= frames) stop()
+    }, burstMs)
+  } else {
+    toneTimer = setInterval(() => {
+      const r = sineFrame(freq, phase)
+      phase = r.phase
+      send(Buffer.concat([header(TYPE.audio, audioSeq++), Buffer.from([0]), r.frame]))
+      if (++n >= frames) stop()
+    }, 20)
+  }
 }
 
 function sendWav(file) {
@@ -136,21 +155,37 @@ function sendWav(file) {
     off += 8 + size + (size % 2)
   }
   if (!data) { log('no data chunk in', file); return }
-  log(`sending WAV ${file}, ${(data.length / 2 / 16000).toFixed(2)}s`)
+  log(`sending WAV ${file}, ${(data.length / 2 / 16000).toFixed(2)}s${burstMs > 0 ? ` burst=${burstMs}ms` : ''}`)
   sendVoice(true)
   let pos = 0
-  const timer = setInterval(() => {
-    const frame = Buffer.alloc(640)
-    const n = Math.min(640, data.length - pos)
-    if (n > 0) data.copy(frame, 0, pos, pos + n)
-    pos += n
-    send(Buffer.concat([header(TYPE.audio, audioSeq++), Buffer.from([0]), frame]))
-    if (pos >= data.length) {
-      clearInterval(timer)
-      sendVoice(false)
-      log('wav done')
-    }
-  }, 20)
+  let wavTimer = null
+  const stop = () => {
+    clearInterval(wavTimer)
+    sendVoice(false)
+    log('wav done')
+  }
+  if (burstMs > 0) {
+    const per = Math.max(1, Math.round(burstMs / 20))
+    wavTimer = setInterval(() => {
+      for (let i = 0; i < per && pos < data.length; i++) {
+        const frame = Buffer.alloc(640)
+        const n = Math.min(640, data.length - pos)
+        data.copy(frame, 0, pos, pos + n)
+        pos += n
+        send(Buffer.concat([header(TYPE.audio, audioSeq++), Buffer.from([0]), frame]))
+      }
+      if (pos >= data.length) stop()
+    }, burstMs)
+  } else {
+    wavTimer = setInterval(() => {
+      const frame = Buffer.alloc(640)
+      const n = Math.min(640, data.length - pos)
+      if (n > 0) data.copy(frame, 0, pos, pos + n)
+      pos += n
+      send(Buffer.concat([header(TYPE.audio, audioSeq++), Buffer.from([0]), frame]))
+      if (pos >= data.length) stop()
+    }, 20)
+  }
 }
 
 function wavBytes() {
